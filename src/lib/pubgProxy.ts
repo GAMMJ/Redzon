@@ -2,6 +2,7 @@
 import "server-only"; // 클라 컴포넌트가 실수로 import하면 빌드타임 차단 (API 키 보호)
 import axios from "axios";
 import { Redis } from "@upstash/redis";
+import { reportSwallowed, reportUnexpected } from "./reportError";
 
 const PUBG_API_KEY = process.env.PUBG_API_KEY ?? "";
 const PUBG_BASE_URL = "https://api.pubg.com";
@@ -42,8 +43,12 @@ export function isValidShard(shard: unknown): shard is string {
 let redis: Redis | null = null;
 try {
   redis = Redis.fromEnv();
-} catch {
+} catch (err) {
+  // 로컬에서 값을 안 채운 것과 배포에 값을 안 넣은 것이 여기서는 똑같이 생겼다.
+  // 후자가 훨씬 나쁘다 — 캐시가 통째로 꺼진 채로 돌아, 모든 요청이 PUBG로 직행하고
+  // 분당 10회에서 막힌다. 조용히 넘어가면 그 상태를 아무도 모른다.
   redis = null;
+  reportSwallowed("redis:init", err);
 }
 
 export interface ProxyPubgOptions {
@@ -90,7 +95,10 @@ async function readCache(cacheKey: string): Promise<unknown> {
   if (!redis) return null;
   try {
     return (await redis.get(cacheKey)) ?? null;
-  } catch {
+  } catch (err) {
+    // 읽기 실패는 그나마 낫다 — PUBG를 한 번 더 부르면 값은 나온다. 그래도 한도를
+    // 쓰는 건 맞으므로 남긴다.
+    reportSwallowed("redis:read", err, { cacheKey });
     return null;
   }
 }
@@ -181,8 +189,11 @@ async function fetchAndStore(
   if (redis) {
     try {
       await redis.setex(cacheKey, ttl, payload);
-    } catch {
-      // 캐시 저장 실패는 무시 — 이미 받은 응답은 그대로 반환
+    } catch (err) {
+      // 이번 응답은 이미 손에 있으니 그대로 반환한다. 문제는 **다음 요청**이다 —
+      // 저장이 안 됐으니 같은 조회가 또 PUBG를 부른다. 이게 계속되면 분당 10회
+      // 한도에서 사이트가 통째로 막힌다. 이 프로젝트에서 제일 조용한 사고다.
+      reportSwallowed("redis:write", err, { cacheKey, ttl });
     }
   }
   return payload;
@@ -198,8 +209,10 @@ export async function writeCachedValue(cacheKey: string, value: unknown, ttl: nu
   if (!redis) return;
   try {
     await redis.setex(cacheKey, ttl, value);
-  } catch {
-    // 캐시 저장 실패는 무시 — 호출부는 이미 값을 갖고 있다
+  } catch (err) {
+    // 호출부는 이미 값을 갖고 있으니 여기서 던지지 않는다. 위 `fetchAndStore`와 같은
+    // 이유로 남긴다 — 다음 요청이 캐시를 못 쓴다.
+    reportSwallowed("redis:write", err, { cacheKey, ttl });
   }
 }
 
@@ -226,8 +239,10 @@ export async function writeCachedValueIfAbsent(
   if (!redis) return false;
   try {
     return (await redis.set(cacheKey, value, { ex: ttl, nx: true })) === "OK";
-  } catch {
-    // 캐시 저장 실패는 무시 — 호출부는 이미 값을 갖고 있다
+  } catch (err) {
+    // 호출부는 이미 값을 갖고 있다. 다만 실패 표시가 안 남았으므로 같은 오타·같은
+    // 없는 계정이 5분간 계속 한도를 쓴다.
+    reportSwallowed("redis:write-if-absent", err, { cacheKey, ttl });
     return false;
   }
 }
@@ -296,6 +311,10 @@ export async function proxyPubg(
       }
       return Response.json({ error: err.response?.data ?? err.message }, { status, headers });
     }
+    // axios 에러가 아닌 것이 여기 왔다는 건 우리 쪽 버그다 — transform이 던졌거나
+    // 예상 못 한 값이 들어왔거나. 화면에는 그대로 500을 주되(사용자에게 스택을 보일
+    // 이유가 없다) 스로틀 없이 올린다. 드물게 나는 것이라 가려지면 안 된다.
+    reportUnexpected(err, { shard, path });
     return Response.json({ error: "서버 내부 오류가 발생했습니다" }, { status: 500 });
   }
 }
