@@ -18,6 +18,8 @@ export type SwallowedFailure =
   | "redis:init"
   /** 캐시 읽기 실패. 이건 그나마 낫다 — PUBG를 한 번 더 부르면 값은 나온다. */
   | "redis:read"
+  /** 일괄 캐시 읽기(`MGET`) 실패. 한 건이 아니라 그 배치 전체가 미스가 된다. */
+  | "redis:read-many"
   /** 캐시 쓰기 실패. **다음 요청도 캐시를 못 쓴다는 뜻이라 한도가 새기 시작한다.** */
   | "redis:write"
   /** 실패 표시 쓰기(`SET NX`) 실패. 같은 오타가 계속 한도를 쓴다. */
