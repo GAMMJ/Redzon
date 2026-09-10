@@ -58,6 +58,10 @@ export interface ProxyPubgOptions {
   cacheKey?: string;
   // 캐시 저장·응답 전에 raw를 이 함수로 변환 (리더보드 정제 등)
   transform?: (raw: unknown) => unknown;
+  // 캐시를 이미 읽었으니 다시 읽지 말 것 — `readCachedValues`로 일괄 조회한 뒤 미스만
+  // 여기로 보내는 경로에서 쓴다. 안 켜면 방금 미스로 판정한 키를 한 번 더 GET해서
+  // 일괄 읽기로 아낀 명령이 그대로 도로 나간다.
+  skipCacheRead?: boolean;
 }
 
 // 기본 캐시 키 — shard + path + 쿼리 조합 (같은 경로라도 필터가 다르면 다른 응답)
@@ -205,6 +209,48 @@ export async function readCachedValue<T>(cacheKey: string): Promise<T | null> {
   return (await readCache(cacheKey)) as T | null;
 }
 
+/**
+ * 여러 키를 한 번에 읽는다(`MGET`) — 키가 몇 개든 Redis 명령 1개다.
+ *
+ * Upstash는 MGET을 키 개수와 무관하게 명령 하나로 센다. 문서에 없어서 직접 쟀다
+ * (2026-09-09, `docs/local/findings/upstash-mget-billing.md` — mget 1,000회에 Reads가
+ * 정확히 +1,000). **속도 이득은 없다**(병렬 GET 37ms vs MGET 37ms). 줄어드는 것은
+ * 명령 수뿐이고, 그게 이 함수가 있는 유일한 이유다.
+ *
+ * 반환 배열은 **입력 키와 같은 길이·같은 순서**다. 값이 없거나 못 읽은 자리는 null이다.
+ * 호출부가 인덱스로 키와 값을 맞추므로, 이 보장이 깨지면 남의 매치가 내 카드에 뜬다.
+ *
+ * 값을 해석하지 않고 그대로 준다 — 실패 표시(`{pubgFailed}`)가 섞여 있을 수 있다.
+ * PUBG 경로에서 읽었다면 `unwrapCachedPubgValue`로 풀 것.
+ */
+export async function readCachedValues<T>(cacheKeys: string[]): Promise<(T | null)[]> {
+  if (cacheKeys.length === 0) return [];
+  // 캐시가 없으면 전부 미스다. 호출부는 평소와 같은 경로로 PUBG를 부르면 된다.
+  if (!redis) return cacheKeys.map(() => null);
+  try {
+    const values = await redis.mget<unknown[]>(...cacheKeys);
+    // 짧은 배열이 오면 뒤쪽 키가 조용히 사라진다. 길이를 맞춰 미스로 채운다.
+    return cacheKeys.map((_, i) => (values?.[i] ?? null) as T | null);
+  } catch (err) {
+    // 한 건이 아니라 이 배치 전체가 미스가 된다. 매치 요약은 PUBG 한도를 안 쓰지만
+    // 그만큼 화면이 느려지고, 이게 계속되면 캐시가 사실상 꺼진 것과 같다.
+    reportSwallowed("redis:read-many", err, { count: cacheKeys.length });
+    return cacheKeys.map(() => null);
+  }
+}
+
+/**
+ * 일괄로 읽은 값을 `fetchPubgCached`와 같은 규칙으로 푼다.
+ *
+ * `readCachedValues`는 값을 해석하지 않으므로 실패 표시도 그냥 객체로 보인다. 그걸 요약인
+ * 줄 알고 화면에 넘기면 `{"pubgFailed":404}`가 카드로 그려진다. 여기서 걸러
+ * `fetchPubgCached`가 던지는 것과 **같은 오류**로 바꿔, 두 경로가 호출부에 같게 보이게 한다.
+ */
+export function unwrapCachedPubgValue<T>(cached: unknown): T {
+  if (isFailureMark(cached)) throw new CachedPubgFailure(cached.pubgFailed);
+  return cached as T;
+}
+
 export async function writeCachedValue(cacheKey: string, value: unknown, ttl: number): Promise<void> {
   if (!redis) return;
   try {
@@ -253,14 +299,17 @@ export async function fetchPubgCached<T = unknown>(
   path: string,
   params: Record<string, string>,
   ttl: number,
-  { cacheKey: cacheKeyOverride, transform, timeout }: ProxyPubgOptions = {},
+  { cacheKey: cacheKeyOverride, transform, timeout, skipCacheRead }: ProxyPubgOptions = {},
 ): Promise<T> {
   const cacheKey = buildCacheKey(shard, path, params, cacheKeyOverride);
-  const cached = await readCache(cacheKey);
-  // 조금 전에 실패한 조회면 PUBG를 또 두드리지 않는다. 상태 코드를 들고 던져,
-  // 호출부가 방금 받은 실패와 똑같이 다루게 한다.
-  if (isFailureMark(cached)) throw new CachedPubgFailure(cached.pubgFailed);
-  if (cached !== null) return cached as T;
+  // 일괄 읽기로 이미 미스 판정이 난 키면 다시 읽지 않는다.
+  if (!skipCacheRead) {
+    const cached = await readCache(cacheKey);
+    // 조금 전에 실패한 조회면 PUBG를 또 두드리지 않는다. 상태 코드를 들고 던져,
+    // 호출부가 방금 받은 실패와 똑같이 다루게 한다.
+    if (isFailureMark(cached)) throw new CachedPubgFailure(cached.pubgFailed);
+    if (cached !== null) return cached as T;
+  }
   return (await fetchAndStore(shard, path, params, ttl, cacheKey, transform, timeout)) as T;
 }
 
