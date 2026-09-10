@@ -3,6 +3,8 @@ import {
   fetchPubgCached,
   pubgErrorStatus,
   readCachedValue,
+  readCachedValues,
+  unwrapCachedPubgValue,
   writeCachedValue,
   type ProxyPubgOptions,
 } from "@/lib/pubgProxy";
@@ -394,14 +396,32 @@ export async function getMatchSummaries(
   //
   // 요약은 플레이어 기준 투영이라 캐시 키에 playerId가 들어간다.
   // 같은 매치라도 사람마다 다른 요약이 나오므로 키를 공유할 수 없다.
+  const cacheKeys = targets.map(
+    (id) => `match:sum:${MATCH_SUMMARY_SCHEMA_VERSION}:${shard}:${playerId}:${id}`,
+  );
+
+  // 키가 매치마다 따로인 채로 **읽기만** 한 번에 묶는다(`MGET` = 명령 1개).
+  // 키를 한 덩어리로 합치지 않는 이유는 TTL이다 — 매치 하나를 더하려고 덩어리를 다시 쓰면
+  // 그 안의 모든 매치가 수명을 연장받는다. MATCH_SUMMARY_TTL의 7일은 신선도가 아니라
+  // **용량**을 정하는 값이라(matchConstants 주석) 그 청소가 멈추면 무료 256MB가 위험해진다.
+  // `unknown`으로 받는다 — 이 자리에는 요약뿐 아니라 실패 표시도 들어 있을 수 있다.
+  // MatchSummary로 받아 두면 타입이 거짓말을 하고, unwrap을 빠뜨려도 컴파일이 통과한다.
+  const cached = await readCachedValues<unknown>(cacheKeys);
+
   const settled = await Promise.allSettled(
-    targets.map((id) =>
-      fetchPubgCached<MatchSummary | null>(shard, `matches/${id}`, {}, MATCH_SUMMARY_TTL, {
-        cacheKey: `match:sum:${MATCH_SUMMARY_SCHEMA_VERSION}:${shard}:${playerId}:${id}`,
+    targets.map(async (id, i) => {
+      // 히트한 값은 저장할 때 이미 transform을 거친 요약이다. 다시 변환하지 않는다.
+      // 실패 표시가 섞여 있을 수 있어 unwrap이 필요하다 — 그냥 넘기면 {pubgFailed}가 카드가 된다.
+      if (cached[i] !== null) return unwrapCachedPubgValue<MatchSummary | null>(cached[i]);
+
+      // 미스만 PUBG로. 방금 미스로 판정했으므로 캐시를 다시 읽지 않는다.
+      return fetchPubgCached<MatchSummary | null>(shard, `matches/${id}`, {}, MATCH_SUMMARY_TTL, {
+        cacheKey: cacheKeys[i],
         transform: (raw) => toMatchSummary(raw, playerId),
         timeout: MATCH_BATCH_TIMEOUT,
-      }),
-    ),
+        skipCacheRead: true,
+      });
+    }),
   );
 
   // 실패는 화면에서 "N건을 불러오지 못했습니다"로 사용자에게 보이지만 서버 로그에는 안 남는다.
